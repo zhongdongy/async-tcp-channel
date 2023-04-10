@@ -1,250 +1,250 @@
 pub mod libs;
 
-pub use libs::{command::AiTcpCommand, frame::Frame};
-
-use log::{debug, error, info, warn};
-use std::{io::ErrorKind, time::Duration};
-use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::mpsc::{channel, error::TryRecvError, Receiver, Sender},
-    time::timeout,
+pub use libs::{
+    command::{ChannelCommand, ServerCommand},
+    connector::create_connector,
+    frame::Frame,
+    listener::create_listener,
 };
 
-/// Connect to remote endpoint with given command receiver as controller and
-/// a sender as remote message proxy.
-pub async fn create_connector(
+use log::{debug, error, info, warn};
+use std::{collections::BTreeMap, sync::Arc};
+use tokio::{
+    io,
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Mutex,
+    },
+    time::Instant,
+};
+
+pub struct Server {
+    socket_map: Arc<Mutex<BTreeMap<String, Sender<ChannelCommand>>>>,
+    rx_upstream: Arc<Mutex<Receiver<(String, Option<Sender<ChannelCommand>>)>>>,
+    tx_upstream: Sender<(String, Option<Sender<ChannelCommand>>)>,
+    rx_control: Arc<Mutex<Receiver<ServerCommand>>>,
     uri: String,
-    identity: String,
-    mut rx_ctrl: Receiver<AiTcpCommand>,
-    tx_msg: Sender<AiTcpCommand>,
-) -> io::Result<()> {
-    let mut stream = TcpStream::connect(uri.clone()).await?;
-
-    let initial_command = AiTcpCommand::Identify(identity.clone());
-
-    let mut command = Some(initial_command);
-    let mut buffer = vec![0; 1024];
-    let mut read_timeout_ms = 16u64;
-    let mut parsing_buffer: Vec<u8> = vec![];
-    loop {
-        if !command.is_none() {
-            let command_clone = command.clone().unwrap();
-            let frame: Frame = Into::<Frame>::into(command_clone);
-            let frame_bytes: Vec<u8> = frame.clone().into();
-            match stream.write(&frame_bytes).await {
-                Ok(_) => {
-                    debug!(target: "atc-connector", "Message sent to remote endpoint: {}", frame);
-                    command = None;
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::ConnectionReset
-                        || e.kind() == ErrorKind::ConnectionAborted
-                    {
-                        error!(target: "atc-connector", "Connection to remote endpoint broken, message cannot be sent: {:?}", e);
-                        break Ok(());
-                    } else {
-                        warn!(target: "atc-connector", "Error writing message to TCP socket: {:?}", e);
-                    }
-                }
-            };
-        }
-
-        match rx_ctrl.try_recv() {
-            Ok(cmd) => {
-                command = match cmd {
-                    AiTcpCommand::Terminate(_) => {
-                        info!(target: "atc-connector", "User requested job termination, current job will be discarded.");
-                        Some(cmd)
-                    }
-                    AiTcpCommand::Ping => Some(cmd),
-                    _ => {
-                        warn!(target: "atc-connector", "User requested to send command other than `[ChannelMessage]` and `[Terminate]`.");
-                        panic!("You should ONLY send `[ChannelMessage]` or `[Terminate]` command.");
-                    }
-                };
-            }
-            Err(e) => {
-                if e == TryRecvError::Disconnected {
-                    error!(target: "atc-connector", "Command channel receiver disconnected: {:?}", e);
-                    break Ok(());
-                }
-            }
-        }
-
-        if let Ok(res) = timeout(
-            Duration::from_millis(read_timeout_ms),
-            stream.read(&mut buffer),
-        )
-        .await
-        {
-            match res {
-                Ok(n) => {
-                    if n > 0 {
-                        // Reset read timeout
-                        read_timeout_ms = 16;
-
-                        let (frames, remain) =
-                            Frame::parse_sequence(&buffer[0..n], Some(parsing_buffer));
-                        parsing_buffer = remain;
-                        buffer = vec![0; 1024];
-
-                        // let command =
-                        // AiTcpCommand::from(String::from_utf8(buffer[0..n].to_vec()).unwrap());
-                        for frame in frames {
-                            let command: AiTcpCommand = frame.into();
-                            if let AiTcpCommand::ChannelMessage((id, _)) = command.clone() {
-                                if id == identity {
-                                    tx_msg.send(command).await.unwrap();
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::ConnectionReset
-                        || e.kind() == ErrorKind::ConnectionAborted
-                    {
-                        error!(target: "atc-connector", "Error reading from TCP socket, possible because of server unavailable or broken: {:?}", e);
-                        break Ok(());
-                    }
-                    warn!(target: "atc-connector", "Error reading message from TCP socket: {:?}", e);
-                }
-            }
-        } else {
-            // Should increase
-            read_timeout_ms *= 2;
-            read_timeout_ms = read_timeout_ms.min(4096);
-        }
-    }
+    server_started: Arc<Mutex<bool>>,
+    flag_interrupt: Arc<Mutex<bool>>,
 }
 
-/// Create a TCP listener and a upstream channel sender receiver
-/// to allow stream/socket identification and registration.
-pub async fn create_listener(
-    uri: String,
-    tx_up: Sender<(String, Option<Sender<AiTcpCommand>>)>,
-) -> io::Result<()> {
-    let listener = TcpListener::bind(uri.clone()).await?;
+impl Server {
+    pub fn new(uri: String, rx_ctrl: Receiver<ServerCommand>) -> Self {
+        let (tx, rx) = channel(1024);
+        Self {
+            uri,
+            socket_map: Arc::new(Mutex::new(BTreeMap::<String, Sender<ChannelCommand>>::new())),
+            rx_upstream: Arc::new(Mutex::new(rx)),
+            tx_upstream: tx,
+            server_started: Arc::new(Mutex::new(false)),
+            flag_interrupt: Arc::new(Mutex::new(false)),
+            rx_control: Arc::new(Mutex::new(rx_ctrl)),
+        }
+    }
 
-    // Listener loop. For ever incoming socket/stream, create a new async task
-    // to handle it.
-    loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let tx_up = tx_up.clone();
-            tokio::spawn(async move {
-                info!(target: "atc-listener", "New incomming connection");
-                let (tx_down, mut rx_down) = channel::<AiTcpCommand>(1024);
-                let mut buffer = vec![0u8; 1024];
-                let mut parsing_buffer: Vec<u8> = vec![];
-                let mut write_command_buffer: Option<AiTcpCommand> = None;
-
-                let mut job_id = String::new();
-                let mut read_timeout_ms = 16u64;
-
-                loop {
-                    match rx_down.try_recv() {
-                        Ok(command) => {
-                            write_command_buffer = Some(command);
-                        }
-                        Err(_) => (),
+    pub async fn start(&mut self) -> io::Result<()> {
+        let rx_upstream = self.rx_upstream.clone();
+        let socket_map = self.socket_map.clone();
+        let flag_int = self.flag_interrupt.clone();
+        let rx_control = self.rx_control.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    if *flag_int.lock().await == true {
+                        break;
                     }
-
-                    if let Some(command) = write_command_buffer.clone() {
-                        let frame: Frame = command.into();
-                        let frame_bytes: Vec<u8> = frame.into();
-                        match stream.write_all(&frame_bytes).await {
-                            Ok(_) => {
-                                write_command_buffer = None;
+                }
+                {
+                    if let Ok((job_id, sender)) = rx_upstream.lock().await.try_recv() {
+                        match sender {
+                            None => {
+                                debug!(target: "atc-listener", "Removing {} from socket map", job_id);
+                                socket_map.lock().await.remove(&job_id);
                             }
-                            Err(e) => {
-                                if e.kind() == ErrorKind::ConnectionReset {
-                                    warn!(target: "atc-listener", "Connection closed by peer.");
-                                    break;
-                                }
-                                warn!(target:"atc-listener", "Unable to write to stream: {:?}", e);
+                            Some(sender) => {
+                                debug!(target: "atc-listener", "Adding {} to socket map", job_id);
+                                socket_map.lock().await.insert(job_id.clone(), sender);
                             }
                         };
                     }
+                }
 
-                    if let Ok(res) = timeout(
-                        Duration::from_millis(read_timeout_ms),
-                        stream.read(&mut buffer),
-                    )
-                    .await
-                    {
-                        match res {
-                            Ok(n) => {
-                                if n == 0 {
-                                    if let Err(e) = stream.shutdown().await {
-                                        // Notify manager a connection is down and should be removed from btree-map.
-                                        tx_up.send((job_id.clone(), None)).await.unwrap();
-                                        warn!(target: "atc-listener", "Unable to shutdown TCP connection from server side: {:?}", e);
-                                    };
-                                    break (());
-                                }
-                                // Reset read timeout.
-                                read_timeout_ms = 16;
-
-                                let (frames, remain) =
-                                    Frame::parse_sequence(&buffer[0..n], Some(parsing_buffer));
-                                parsing_buffer = remain;
-                                // let content = String::from_utf8(buffer[0..n].to_vec()).unwrap();
-
-                                // debug!(target: "atc-listener", "RAW MESSAGE: `{}`", content);
-
-                                buffer = vec![0u8; 1024];
-
-                                for frame in frames {
-                                    let command = AiTcpCommand::from(frame);
-
-                                    match command {
-                                        AiTcpCommand::Identify(id) => {
-                                            job_id = id;
-                                            info!(target: "atc-listener", "Received identification: {}", job_id);
-                                            match tx_up
-                                                .send((job_id.clone(), Some(tx_down.clone())))
-                                                .await
-                                            {
-                                                Ok(_) => (),
-                                                Err(_) => {
-                                                    error!(target: "atc-listener", "Unable to write to server control channel sender.")
-                                                }
-                                            }
-                                        }
-                                        AiTcpCommand::Terminate(job_id) => {
-                                            tx_up.send((job_id.clone(), None)).await.unwrap();
-                                        }
-                                        AiTcpCommand::Ping => {
-                                            debug!(target: "atc-listener", "Ping received from `{}`", job_id);
-                                            write_command_buffer = Some(AiTcpCommand::Pong);
-                                        }
-                                        _ => (),
-                                    }
-                                }
+                {
+                    if let Ok(server_cmd) = rx_control.lock().await.try_recv() {
+                        if let ServerCommand::Terminate = server_cmd.clone() {
+                            {
+                                *flag_int.lock().await = true;
                             }
-
-                            Err(ref e) if e.kind() == ErrorKind::ConnectionReset => {
-                                debug!(target: "atc-listener", "Connection broken [job-id={}]", job_id);
-                                if let Err(e) = tx_up.send((job_id.clone(), None)).await {
-                                    error!(target: "atc-listener", "Unable to send control message to channel [connection broken]: {:?}", e);
-                                };
-                                break;
-                            }
-                            Err(e) => {
-                                error!(target: "atc-listener", "Error writing bytes to channel: {:?}", e);
-                                break;
-                            }
+                            return;
                         }
-                    } else {
-                        // Should increase
-                        read_timeout_ms *= 2;
-                        read_timeout_ms = read_timeout_ms.min(4096);
+
+                        let (target_job_id, msg) = match server_cmd.clone() {
+                            ServerCommand::Message(t, m) => (t, m),
+                            ServerCommand::Terminate => {
+                                panic!("Need to be handled before entering this LOC")
+                            }
+                        };
+                        for (job_id, sender) in socket_map.lock().await.iter() {
+                            {
+                                if *flag_int.lock().await == true {
+                                    break;
+                                }
+                            }
+
+                            if !target_job_id.is_none() && target_job_id.clone().unwrap() != *job_id
+                            {
+                                continue;
+                            }
+
+                            let job_id = job_id.clone();
+                            let sender = sender.clone();
+
+                            if let Err(e) = sender
+                                .send(ChannelCommand::ChannelMessage((
+                                    job_id.clone(),
+                                    msg.clone(),
+                                )))
+                                .await
+                            {
+                                warn!(target: "atc-listener", "Error sending to message channel: {:?}", e);
+                            } else {
+                                debug!(target: "atc-listener", "Message sent to `{}`", job_id);
+                            };
+                        }
+                    }
+                }
+            }
+        });
+
+        let uri = self.uri.clone();
+        let server_started = self.server_started.clone();
+        let tx_upstream = self.tx_upstream.clone();
+
+        info!(target: "atc-listener", "Ready to start server `{}`:", uri.clone());
+        *server_started.lock().await = true;
+        if let Err(e) = create_listener(uri.clone(), tx_upstream, self.flag_interrupt.clone()).await
+        {
+            error!(target: "atc-listener", "Unable to bind to `{}`: `{:?}`", uri.clone(), e );
+            *server_started.lock().await = false;
+        }
+
+        Ok(())
+    }
+}
+
+pub struct Client {
+    rx_control: Arc<Mutex<Receiver<ChannelCommand>>>,
+    tx_control: Sender<ChannelCommand>,
+    rx_message: Arc<Mutex<Receiver<ChannelCommand>>>,
+    tx_message: Sender<ChannelCommand>,
+    rx_outer_control: Arc<Mutex<Receiver<ServerCommand>>>,
+    uri: String,
+    pub id: String,
+    callback_handler: Arc<Mutex<Option<ClientCallbackHandler>>>,
+    flag_interupt: Arc<Mutex<bool>>,
+}
+
+pub enum ClientCallbackHandler {
+    Closure(Box<dyn FnMut(String, String) + Send>),
+    Channel(Sender<(String, String)>),
+}
+
+impl Client {
+    pub fn new(uri: String, rx_outer_ctrl: Receiver<ServerCommand>) -> Self {
+        let (tx_ctrl, rx_ctrl) = channel::<ChannelCommand>(1);
+        let (tx_msg, rx_msg) = channel::<ChannelCommand>(1);
+        Self {
+            rx_control: Arc::new(Mutex::new(rx_ctrl)),
+            tx_control: tx_ctrl,
+            rx_message: Arc::new(Mutex::new(rx_msg)),
+            tx_message: tx_msg,
+            uri,
+            id: uuid::Uuid::new_v4().to_string(),
+            callback_handler: Arc::new(Mutex::new(None)),
+            rx_outer_control: Arc::new(Mutex::new(rx_outer_ctrl)),
+            flag_interupt: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    pub async fn callback(self, cb: impl FnMut(String, String) + Send + 'static) -> Self {
+        *self.callback_handler.lock().await = Some(ClientCallbackHandler::Closure(Box::new(cb)));
+        self
+    }
+
+    pub async fn sender(self, sender: Sender<(String, String)>) -> Self {
+        *self.callback_handler.lock().await = Some(ClientCallbackHandler::Channel(sender));
+        self
+    }
+
+    pub async fn connect(&mut self) -> io::Result<()> {
+        // Create another async task that always execute.
+        // Move the message channel receiver and move a clone of control channel
+        // sender into the task
+        let tx_ctrl = self.tx_control.clone();
+        let rx_msg = self.rx_message.clone();
+        let rx_outer_ctrl = self.rx_outer_control.clone();
+        let callback_handler = self.callback_handler.clone();
+        let flag_int = self.flag_interupt.clone();
+        tokio::spawn(async move {
+            let mut last_ping = Instant::now();
+
+            loop {
+                {
+                    if *flag_int.lock().await == true {
+                        return;
+                    }
+                }
+                if last_ping.elapsed().as_secs() >= 5 {
+                    match tx_ctrl.send(ChannelCommand::Ping).await {
+                        Ok(_) => {
+                            last_ping = Instant::now();
+                        }
+                        Err(e) => {
+                            error!(target: "atc-connector", "Unable to initualize PING command: {:?}", e);
+                            return;
+                        }
+                    };
+                }
+                {
+                    if let Ok(data) = rx_outer_ctrl.lock().await.try_recv() {
+                        if data == ServerCommand::Terminate {
+                            *flag_int.lock().await = true;
+                            return;
+                        }
                     }
                 }
 
-                info!(target: "atc-listener", "Socket/stream handler for job-id=`{}` closed.", job_id);
-            });
-        }
+                {
+                    if let Ok(data) = rx_msg.lock().await.try_recv() {
+                        if let ChannelCommand::ChannelMessage((job_id, message)) = data.clone() {
+                            if let Some(handler) = callback_handler.lock().await.as_mut() {
+                                match handler {
+                                    ClientCallbackHandler::Closure(closure) => {
+                                        closure(job_id, message)
+                                    }
+                                    ClientCallbackHandler::Channel(sender) => {
+                                        sender.send((job_id, message)).await.unwrap()
+                                    }
+                                }
+                            }
+                        }
+                    };
+                }
+            }
+        });
+
+        let id = self.id.clone();
+        let rx_ctrl = self.rx_control.clone();
+        let tx_msg = self.tx_message.clone();
+        let uri = self.uri.clone();
+        let flag_int_clone = self.flag_interupt.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = create_connector(uri.clone(), id, rx_ctrl, tx_msg, flag_int_clone).await {
+                error!(target: "atc-connector", "Unable to connect to remote server `{}`: {:?}",uri, e);
+            }
+        }).await.unwrap();
+
+        Ok(())
     }
 }

@@ -1,6 +1,5 @@
-use atc::{create_connector, AiTcpCommand};
-use log::error;
-use std::{error::Error, path::PathBuf, time::Instant};
+use atc::{Client, ServerCommand};
+use std::{error::Error, path::PathBuf, time::Duration};
 use tokio::sync::mpsc::channel;
 
 #[tokio::main]
@@ -9,39 +8,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         log4rs::init_file("log4rs.yml", Default::default()).unwrap();
     }
 
-    let (tx_ctrl, rx_ctrl) = channel::<AiTcpCommand>(1);
-    let (tx_msg, mut rx_msg) = channel::<AiTcpCommand>(1);
+    let (tx, rx) = channel::<ServerCommand>(1024);
 
-    let id = uuid::Uuid::new_v4().to_string();
-
-    // Create another async task that always execute.
-    // Move the message channel receiver and move a clone of control channel
-    // sender into the task
-    let tx_ctrl = tx_ctrl.clone();
     tokio::spawn(async move {
-        let mut last_ping = Instant::now();
-
-        loop {
-            if last_ping.elapsed().as_secs() >= 5 {
-                match tx_ctrl.send(AiTcpCommand::Ping).await {
-                    Ok(_) => {
-                        last_ping = Instant::now();
-                    }
-                    Err(e) => {
-                        error!(target: "atc-connector", "Unable to initualize PING command: {:?}", e);
-                        return;
-                    }
-                };
-            }
-            if let Ok(data) = rx_msg.try_recv() {
-                println!("Command: {:?}", data);
-            };
-        }
+        std::thread::sleep(Duration::from_secs(2));
+        tx.send(ServerCommand::Terminate).await.unwrap();
     });
 
-    if let Err(e) = create_connector("127.0.0.1:52926".into(), id, rx_ctrl, tx_msg.clone()).await {
-        error!(target: "atc-connector", "Unable to connect to remote server: {:?}", e);
-    }
+    let mut client = Client::new("127.0.0.1:52926".into(), rx)
+        .callback(|job_id, msg| {
+            println!("Message from `{}`: {}", job_id, msg);
+        })
+        .await;
+
+    client.connect().await.unwrap();
 
     Ok(())
 }

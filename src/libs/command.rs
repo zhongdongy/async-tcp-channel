@@ -10,8 +10,18 @@ lazy_static! {
     static ref RE_CMD_TERMINATE: Regex = Regex::new(r"^@terminate<(?P<job_id>[a-f\d-]+)>").unwrap();
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerCommand {
+    /// Send message to give target.
+    Message(Option<String>, String),
+
+    /// Terminate server.
+    Terminate,
+}
+
 #[derive(Debug, Clone)]
-pub enum AiTcpCommand {
+pub enum ChannelCommand {
     /// Identify the connection endpoint, normally use `job-id`.
     Identify(String),
 
@@ -28,22 +38,22 @@ pub enum AiTcpCommand {
     Pong,
 }
 
-impl Into<Frame> for AiTcpCommand {
+impl Into<Frame> for ChannelCommand {
     fn into(self) -> Frame {
         (match self {
-            AiTcpCommand::Identify(id) => format!("@identify<{}>", id),
-            AiTcpCommand::Terminate(id) => format!("@terminate<{}>", id),
-            AiTcpCommand::ChannelMessage((id, msg)) => {
+            ChannelCommand::Identify(id) => format!("@identify<{}>", id),
+            ChannelCommand::Terminate(id) => format!("@terminate<{}>", id),
+            ChannelCommand::ChannelMessage((id, msg)) => {
                 format!("@message<{}>{}", id, msg)
             }
-            AiTcpCommand::Ping => format!("@ping"),
-            AiTcpCommand::Pong => format!("@pong"),
+            ChannelCommand::Ping => format!("@ping"),
+            ChannelCommand::Pong => format!("@pong"),
         })
         .into()
     }
 }
 
-impl From<Frame> for AiTcpCommand {
+impl From<Frame> for ChannelCommand {
     fn from(value: Frame) -> Self {
         let value: String = value.into();
         if &value == "@ping" {
