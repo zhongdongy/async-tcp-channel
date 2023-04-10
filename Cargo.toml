@@ -9,6 +9,7 @@ categories = ["network-programming"]
 keywords = ["async", "tcp-channel"]
 license-file = "LICENSE"
 include = ["/src"]
+description = "A low level TCP socket/stream based message channel implementation."
 
 [dependencies]
 lazy_static = "1.4.0"
