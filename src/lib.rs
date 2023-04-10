@@ -150,7 +150,7 @@ pub enum ClientCallbackHandler {
 }
 
 impl Client {
-    pub fn new(uri: String, rx_outer_ctrl: Receiver<ServerCommand>) -> Self {
+    pub fn new(uri: String, id: String, rx_outer_ctrl: Receiver<ServerCommand>) -> Self {
         let (tx_ctrl, rx_ctrl) = channel::<ChannelCommand>(1);
         let (tx_msg, rx_msg) = channel::<ChannelCommand>(1);
         Self {
@@ -159,7 +159,7 @@ impl Client {
             rx_message: Arc::new(Mutex::new(rx_msg)),
             tx_message: tx_msg,
             uri,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: id,
             callback_handler: Arc::new(Mutex::new(None)),
             rx_outer_control: Arc::new(Mutex::new(rx_outer_ctrl)),
             flag_interupt: Arc::new(Mutex::new(false)),

@@ -15,11 +15,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tx.send(ServerCommand::Terminate).await.unwrap();
     });
 
-    let mut client = Client::new("127.0.0.1:52926".into(), rx)
-        .callback(|job_id, msg| {
-            println!("Message from `{}`: {}", job_id, msg);
-        })
-        .await;
+    let mut client = Client::new(
+        "127.0.0.1:52926".into(),
+        uuid::Uuid::new_v4().to_string(),
+        rx,
+    )
+    .callback(|job_id, msg| {
+        println!("Message from `{}`: {}", job_id, msg);
+    })
+    .await;
 
     client.connect().await.unwrap();
 
