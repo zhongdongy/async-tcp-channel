@@ -8,6 +8,7 @@ pub use libs::{
 };
 
 use log::{debug, error, info, warn};
+use queues::{IsQueue, Queue};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
     io,
@@ -17,6 +18,50 @@ use tokio::{
     },
     time::Instant,
 };
+
+pub struct ChannelInfo {
+    last_write: Instant,
+    messages: Queue<String>,
+}
+
+impl ChannelInfo {
+    pub fn new(message: String) -> Self {
+        let mut messages: Queue<String> = Queue::new();
+        messages.add(message).unwrap();
+        Self {
+            last_write: Instant::now(),
+            messages,
+        }
+    }
+
+    /// Add element into a queue.
+    pub fn enqueue(&mut self, message: String) {
+        self.messages.add(message).unwrap();
+    }
+
+    /// Get head element of a queue, this doesn't remove it from queue.
+    pub fn head(&mut self) -> Option<String> {
+        if let Ok(val) = self.messages.peek() {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    pub fn update_instant(&mut self) {
+        self.last_write = Instant::now();
+    }
+
+    /// You should call head to get the head element and then call this method
+    /// to remove it from queue.
+    pub fn dequeue(&mut self) -> bool {
+        self.messages.remove().is_ok()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.size()
+    }
+}
 
 pub struct Server {
     socket_map: Arc<Mutex<BTreeMap<String, Sender<ChannelCommand>>>>,
@@ -47,72 +92,137 @@ impl Server {
         let socket_map = self.socket_map.clone();
         let flag_int = self.flag_interrupt.clone();
         let rx_control = self.rx_control.clone();
+
+        let message_queue: Arc<Mutex<BTreeMap<String, ChannelInfo>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+
         tokio::spawn(async move {
             loop {
-                {
-                    if *flag_int.lock().await == true {
-                        break;
-                    }
+                let flag_int_guard = flag_int.lock().await;
+                if *flag_int_guard == true {
+                    break;
                 }
-                {
-                    if let Ok((job_id, sender)) = rx_upstream.lock().await.try_recv() {
-                        match sender {
-                            None => {
-                                debug!(target: "atc-listener", "Removing {} from socket map", job_id);
-                                socket_map.lock().await.remove(&job_id);
-                            }
-                            Some(sender) => {
-                                debug!(target: "atc-listener", "Adding {} to socket map", job_id);
-                                socket_map.lock().await.insert(job_id.clone(), sender);
-                            }
-                        };
-                    }
-                }
+                drop(flag_int_guard);
 
-                {
-                    if let Ok(server_cmd) = rx_control.lock().await.try_recv() {
-                        if let ServerCommand::Terminate = server_cmd.clone() {
-                            {
-                                *flag_int.lock().await = true;
-                            }
-                            return;
+                let mut rx_upstream_guard = rx_upstream.lock().await;
+                if let Ok((channel_id, sender)) = rx_upstream_guard.try_recv() {
+                    match sender {
+                        None => {
+                            debug!(target: "atc-listener", "Removing {} from socket map", channel_id);
+                            socket_map.lock().await.remove(&channel_id);
                         }
+                        Some(sender) => {
+                            debug!(target: "atc-listener", "Adding {} to socket map", channel_id);
+                            socket_map.lock().await.insert(channel_id.clone(), sender);
+                        }
+                    };
+                }
+                drop(rx_upstream_guard);
 
-                        let (target_job_id, msg) = match server_cmd.clone() {
-                            ServerCommand::Message(t, m) => (t, m),
-                            ServerCommand::Terminate => {
-                                panic!("Need to be handled before entering this LOC")
-                            }
-                        };
-                        for (job_id, sender) in socket_map.lock().await.iter() {
-                            {
-                                if *flag_int.lock().await == true {
-                                    break;
-                                }
-                            }
+                // Handle queued messages.
+                // For each channel with queued messages, only one message will
+                // be sent to the channel.
+                let mut message_queue_guard = message_queue.lock().await;
+                let socket_map_guard = socket_map.lock().await;
+                let mut should_drop_channel_ids = vec![];
+                for (channel_id, channel_info) in message_queue_guard.iter_mut() {
+                    if channel_info.last_write.elapsed().as_secs() > 60 {
+                        // Last write operation was 60 seconds ago, should not
+                        // queue this anymore, drop all existing messages.
+                        should_drop_channel_ids.push(channel_id.clone());
+                        warn!(target: "atc-listener", "Message queue of channel (`{}`) will be dropped due to inactivity for more than 60 seconds", channel_id);
+                        continue;
+                    }
+                    if channel_info.len() > 128 {
+                        // Too many queued messages, drop all existing messages.
+                        should_drop_channel_ids.push(channel_id.clone());
+                        warn!(target: "atc-listener", "Message queue of channel (`{}`) will be dropped due to exceeds 128 message limit", channel_id);
+                        continue;
+                    }
+                    if socket_map_guard.contains_key(channel_id) && channel_info.len() > 0 {
+                        // Should try send message.
+                        let oldest_msg = channel_info.head().unwrap();
+                        let sender = socket_map_guard.get(channel_id).unwrap().clone();
+                        if let Ok(_) = sender
+                            .send(ChannelCommand::ChannelMessage((
+                                channel_id.clone(),
+                                oldest_msg,
+                            )))
+                            .await
+                        {
+                            channel_info.dequeue();
+                            channel_info.update_instant();
+                            debug!(target: "atc-listener", "One queued message sent to existing channel `{}`.", channel_id);
+                        } else {
+                            warn!(target: "atc-listener", "One queued message not sent to existing channel `{}`.", channel_id);
+                        }
+                    }
+                }
+                should_drop_channel_ids.iter().for_each(|id| {
+                    message_queue_guard.remove(id);
+                });
+                drop(socket_map_guard);
+                drop(message_queue_guard);
 
-                            if !target_job_id.is_none() && target_job_id.clone().unwrap() != *job_id
-                            {
-                                continue;
-                            }
+                let mut rx_control_guard = rx_control.lock().await;
+                if let Ok(server_cmd) = rx_control_guard.try_recv() {
+                    if let ServerCommand::Terminate = server_cmd.clone() {
+                        let mut flag_int_guard = flag_int.lock().await;
+                        *flag_int_guard = true;
+                        drop(flag_int_guard);
+                        return;
+                    }
 
-                            let job_id = job_id.clone();
-                            let sender = sender.clone();
+                    let (target_channel_id, msg) = match server_cmd.clone() {
+                        ServerCommand::Message(t, m) => (t, m),
+                        ServerCommand::Terminate => {
+                            panic!("Need to be handled before entering this LOC")
+                        }
+                    };
 
+                    // Check if target channel id exists in `socket_map`, or
+                    // Add to queue and wait for a while.
+                    if let Some(target_channel_id) = target_channel_id {
+                        let socket_map_guard = socket_map.lock().await;
+                        if socket_map_guard.contains_key(&target_channel_id) {
+                            let sender = socket_map_guard.get(&target_channel_id).unwrap().clone();
                             if let Err(e) = sender
                                 .send(ChannelCommand::ChannelMessage((
-                                    job_id.clone(),
+                                    target_channel_id.clone(),
                                     msg.clone(),
                                 )))
                                 .await
                             {
-                                warn!(target: "atc-listener", "Error sending to message channel: {:?}", e);
+                                warn!(target: "atc-listener", "Error sending to message channel [will be queued]: {:?}", e);
+
+                                // Put to message queue.
+                                let mut queue = message_queue.lock().await;
+                                if queue.contains_key(&target_channel_id) {
+                                    queue.get_mut(&target_channel_id).unwrap().enqueue(msg);
+                                } else {
+                                    queue.insert(target_channel_id, ChannelInfo::new(msg));
+                                }
+                                drop(queue);
                             } else {
-                                debug!(target: "atc-listener", "Message sent to `{}`", job_id);
+                                debug!(target: "atc-listener", "Message sent to `{}`", target_channel_id);
                             };
+                        } else {
+                            // Channel ID doesn't exist, put into queue.
+                            let mut queue = message_queue.lock().await;
+                            if queue.contains_key(&target_channel_id) {
+                                queue.get_mut(&target_channel_id).unwrap().enqueue(msg);
+                            } else {
+                                queue.insert(target_channel_id, ChannelInfo::new(msg));
+                            }
+                            drop(queue);
                         }
+                        drop(socket_map_guard);
+                    } else {
+                        // Note: messages without target channel id will not be
+                        // queued.
                     }
                 }
+                drop(rx_control_guard);
             }
         });
 
@@ -142,6 +252,7 @@ pub struct Client {
     pub id: String,
     callback_handler: Arc<Mutex<Option<ClientCallbackHandler>>>,
     flag_interupt: Arc<Mutex<bool>>,
+    should_reconnect: bool,
 }
 
 pub enum ClientCallbackHandler {
@@ -163,6 +274,14 @@ impl Client {
             callback_handler: Arc::new(Mutex::new(None)),
             rx_outer_control: Arc::new(Mutex::new(rx_outer_ctrl)),
             flag_interupt: Arc::new(Mutex::new(false)),
+            should_reconnect: false,
+        }
+    }
+
+    pub fn reconnect(self, should_reconnect: bool) -> Self {
+        Self {
+            should_reconnect,
+            ..self
         }
     }
 
@@ -185,6 +304,7 @@ impl Client {
         let rx_outer_ctrl = self.rx_outer_control.clone();
         let callback_handler = self.callback_handler.clone();
         let flag_int = self.flag_interupt.clone();
+
         tokio::spawn(async move {
             let mut last_ping = Instant::now();
 
@@ -216,14 +336,15 @@ impl Client {
 
                 {
                     if let Ok(data) = rx_msg.lock().await.try_recv() {
-                        if let ChannelCommand::ChannelMessage((job_id, message)) = data.clone() {
+                        if let ChannelCommand::ChannelMessage((channel_id, message)) = data.clone()
+                        {
                             if let Some(handler) = callback_handler.lock().await.as_mut() {
                                 match handler {
                                     ClientCallbackHandler::Closure(closure) => {
-                                        closure(job_id, message)
+                                        closure(channel_id, message)
                                     }
                                     ClientCallbackHandler::Channel(sender) => {
-                                        sender.send((job_id, message)).await.unwrap()
+                                        sender.send((channel_id, message)).await.unwrap()
                                     }
                                 }
                             }
@@ -232,19 +353,34 @@ impl Client {
                 }
             }
         });
+        let mut reconnect_attempts = 0;
+        loop {
+            let id = self.id.clone();
+            let rx_ctrl = self.rx_control.clone();
+            let tx_msg = self.tx_message.clone();
+            let uri = self.uri.clone();
+            let flag_int_clone = self.flag_interupt.clone();
 
-        let id = self.id.clone();
-        let rx_ctrl = self.rx_control.clone();
-        let tx_msg = self.tx_message.clone();
-        let uri = self.uri.clone();
-        let flag_int_clone = self.flag_interupt.clone();
+            tokio::spawn(async move {
+                if let Err(e) = create_connector(uri.clone(), id, rx_ctrl, tx_msg, flag_int_clone).await {
+                    error!(target: "atc-connector", "Unable to connect to remote server `{}`: {:?}",uri, e);
+                }
+            }).await.unwrap();
 
-        tokio::spawn(async move {
-            if let Err(e) = create_connector(uri.clone(), id, rx_ctrl, tx_msg, flag_int_clone).await {
-                error!(target: "atc-connector", "Unable to connect to remote server `{}`: {:?}",uri, e);
+            if !self.should_reconnect || *self.flag_interupt.lock().await {
+                warn!(target: "atc-connector", "Reconnect not enabled or user requested termination from client side.");
+                break;
             }
-        }).await.unwrap();
+            if reconnect_attempts> 8 {
+                warn!(target: "atc-connector", "No more reconnecting after 8 attempts.");
+                break;
+            }
 
+            // `should_reconnect` flag set to true, and interrupt flag not set
+            // will restart another connection.
+            info!(target: "atc-connector", "Client connection restarting");
+            reconnect_attempts+=1;
+        }
         Ok(())
     }
 }

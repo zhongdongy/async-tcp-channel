@@ -12,16 +12,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (tx, rx) = channel::<ServerCommand>(1024);
 
     tokio::spawn(async move {
+        // Send a message to given channel every 1 second.
         let timer = Instant::now();
         loop {
-            if timer.elapsed().as_secs() >= 5 {
-                tx.send(ServerCommand::Terminate).await.unwrap();
-                break;
-            }
-
             tx.send(ServerCommand::Message(
-                None,
-                format!("{} seconds to explode!", { 5 - timer.elapsed().as_secs() }),
+                Some("test-async-tcp-channel".into()),
+                format!("{} seconds passed!", timer.elapsed().as_secs()),
             ))
             .await
             .unwrap();

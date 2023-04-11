@@ -1,5 +1,5 @@
 use atc::{Client, ServerCommand};
-use std::{error::Error, path::PathBuf, time::Duration};
+use std::{error::Error, path::PathBuf};
 use tokio::sync::mpsc::channel;
 
 #[tokio::main]
@@ -8,18 +8,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         log4rs::init_file("log4rs.yml", Default::default()).unwrap();
     }
 
-    let (tx, rx) = channel::<ServerCommand>(1024);
-
-    tokio::spawn(async move {
-        std::thread::sleep(Duration::from_secs(2));
-        tx.send(ServerCommand::Terminate).await.unwrap();
-    });
+    let (_tx, rx) = channel::<ServerCommand>(1024);
 
     let mut client = Client::new(
         "127.0.0.1:52926".into(),
-        uuid::Uuid::new_v4().to_string(),
+        "test-async-tcp-channel".into(),
         rx,
     )
+    .reconnect(true)
     .callback(|job_id, msg| {
         println!("Message from `{}`: {}", job_id, msg);
     })
