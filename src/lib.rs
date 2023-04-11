@@ -19,15 +19,30 @@ use tokio::{
     time::Instant,
 };
 
+#[derive(Clone)]
+pub struct QueuedMessage {
+    pub content: String,
+    hit_count: u32,
+}
+
+impl QueuedMessage {
+    pub fn new(content: String) -> Self {
+        Self {
+            content,
+            hit_count: 0,
+        }
+    }
+}
+
 pub struct ChannelInfo {
     last_write: Instant,
-    messages: Queue<String>,
+    messages: Queue<QueuedMessage>,
 }
 
 impl ChannelInfo {
     pub fn new(message: String) -> Self {
-        let mut messages: Queue<String> = Queue::new();
-        messages.add(message).unwrap();
+        let mut messages: Queue<QueuedMessage> = Queue::new();
+        messages.add(QueuedMessage::new(message)).unwrap();
         Self {
             last_write: Instant::now(),
             messages,
@@ -36,13 +51,26 @@ impl ChannelInfo {
 
     /// Add element into a queue.
     pub fn enqueue(&mut self, message: String) {
-        self.messages.add(message).unwrap();
+        self.messages.add(QueuedMessage::new(message)).unwrap();
     }
 
     /// Get head element of a queue, this doesn't remove it from queue.
+    ///
+    /// Any elements that has been visited more than 16 times will be forced to
+    /// dequeue.
     pub fn head(&mut self) -> Option<String> {
-        if let Ok(val) = self.messages.peek() {
-            Some(val)
+        if let Ok(mut val) = self.messages.peek() {
+            if val.hit_count >= 16 {
+                return if self.messages.size() > 1 {
+                    self.dequeue();
+                    self.head()
+                } else {
+                    None
+                };
+            }
+
+            val.hit_count += 1;
+            Some(val.content)
         } else {
             None
         }
