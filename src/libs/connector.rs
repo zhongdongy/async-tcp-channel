@@ -16,7 +16,7 @@ use tokio::{
 /// a sender as remote message proxy.
 pub async fn create_connector(
     uri: String,
-    identity: String,
+    mut identity: String,
     rx_ctrl: Arc<Mutex<Receiver<ChannelCommand>>>,
     tx_msg: Sender<ChannelCommand>,
     flag_int: Arc<Mutex<bool>>,
@@ -60,13 +60,14 @@ pub async fn create_connector(
         {
             match rx_ctrl.lock().await.try_recv() {
                 Ok(cmd) => {
-                    command = match cmd {
+                    command = match cmd.clone() {
                         ChannelCommand::Terminate(_) => {
                             info!(target: "atc-connector", "User requested job termination, current job will be discarded.");
                             Some(cmd)
                         }
-                        ChannelCommand::Identify(_) => {
-                            info!(target: "atc-connector", "User re-identification.");
+                        ChannelCommand::Identify(id) => {
+                            info!(target: "atc-connector", "User re-identification: {}.", id);
+                            identity = id;
                             Some(cmd)
                         }
                         ChannelCommand::Ping => Some(cmd),
