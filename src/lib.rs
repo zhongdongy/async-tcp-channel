@@ -175,7 +175,7 @@ impl Server {
 
                     let (target_channel_id, msg) = match server_cmd.clone() {
                         ServerCommand::Message(t, m) => (t, m),
-                        ServerCommand::Terminate => {
+                        _ => {
                             panic!("Need to be handled before entering this LOC")
                         }
                     };
@@ -330,6 +330,8 @@ impl Client {
                         if data == ServerCommand::Terminate {
                             *flag_int.lock().await = true;
                             return;
+                        } else if let ServerCommand::Identify(id) = data {
+                            tx_ctrl.send(ChannelCommand::Identify(id)).await.unwrap();
                         }
                     }
                 }
@@ -371,7 +373,7 @@ impl Client {
                 warn!(target: "atc-connector", "Reconnect not enabled or user requested termination from client side.");
                 break;
             }
-            if reconnect_attempts> 8 {
+            if reconnect_attempts > 8 {
                 warn!(target: "atc-connector", "No more reconnecting after 8 attempts.");
                 break;
             }
@@ -379,7 +381,7 @@ impl Client {
             // `should_reconnect` flag set to true, and interrupt flag not set
             // will restart another connection.
             info!(target: "atc-connector", "Client connection restarting");
-            reconnect_attempts+=1;
+            reconnect_attempts += 1;
         }
         Ok(())
     }

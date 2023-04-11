@@ -65,11 +65,15 @@ pub async fn create_connector(
                             info!(target: "atc-connector", "User requested job termination, current job will be discarded.");
                             Some(cmd)
                         }
+                        ChannelCommand::Identify(_) => {
+                            info!(target: "atc-connector", "User re-identification.");
+                            Some(cmd)
+                        }
                         ChannelCommand::Ping => Some(cmd),
                         _ => {
-                            warn!(target: "atc-connector", "User requested to send command other than `[ChannelMessage]` and `[Terminate]`.");
+                            warn!(target: "atc-connector", "User requested to send command other than `[ChannelMessage]`, `[Identify]` and `[Terminate]`.");
                             panic!(
-                                "You should ONLY send `[ChannelMessage]` or `[Terminate]` command."
+                                "You should ONLY send `[ChannelMessage]`, `[Identify]` or `[Terminate]` command."
                             );
                         }
                     };
