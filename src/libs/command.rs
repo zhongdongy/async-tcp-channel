@@ -4,10 +4,10 @@ use regex::Regex;
 use super::frame::Frame;
 
 lazy_static! {
-    static ref RE_CMD_IDENTIFY: Regex = Regex::new(r"^@identify<(?P<job_id>[a-f\d-]+)>").unwrap();
+    static ref RE_CMD_IDENTIFY: Regex = Regex::new(r"^@identify<(?P<job_id>[a-zA-Z\d_-]+)>").unwrap();
     static ref RE_CMD_CHANNEL_MESSAGE: Regex =
-        Regex::new(r"^@message<(?P<job_id>[a-f\d-]+)>(?P<message>.*)$").unwrap();
-    static ref RE_CMD_TERMINATE: Regex = Regex::new(r"^@terminate<(?P<job_id>[a-f\d-]+)>").unwrap();
+        Regex::new(r"^@message<(?P<job_id>[a-zA-Z\d_-]+)>(?P<message>.*)$").unwrap();
+    static ref RE_CMD_TERMINATE: Regex = Regex::new(r"^@terminate<(?P<job_id>[a-zA-Z\d_-]+)>").unwrap();
 }
 
 
