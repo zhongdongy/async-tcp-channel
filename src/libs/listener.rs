@@ -9,7 +9,7 @@ use tokio::{
         mpsc::{channel, Sender},
         Mutex,
     },
-    time::timeout,
+    time::{timeout, Instant},
 };
 
 /// Create a TCP listener and a upstream channel sender receiver
@@ -34,11 +34,16 @@ pub async fn create_listener(
             if let Ok((mut stream, _)) = listen_result {
                 let tx_up = tx_up.clone();
 
+                // Time elapsed since last PING or channel message.
+                let mut last_active = Instant::now();
+
                 let flag_int_clone = flag_int.clone();
                 tokio::spawn(async move {
                     info!(target: "atc-listener", "New incomming connection");
                     let (tx_down, mut rx_down) = channel::<ChannelCommand>(1024);
-                    let mut buffer = vec![0u8; 1024];
+
+                    let mut buffer = vec![0u8; 65535];
+                    
                     let mut parsing_buffer: Vec<u8> = vec![];
                     let mut write_command_buffer: Option<ChannelCommand> = None;
 
@@ -46,6 +51,12 @@ pub async fn create_listener(
                     let mut read_timeout_ms = 16f32;
 
                     loop {
+                        // Check for time elapsed.
+                        if last_active.elapsed().as_secs() > 60 {
+                            warn!(target: "atc-listener", "Connection will be reset due to 60 seconds of inactivity.");
+                            return;
+                        }
+
                         {
                             if *flag_int_clone.lock().await == true {
                                 return;
@@ -86,6 +97,7 @@ pub async fn create_listener(
                                     return;
                                 }
                             }
+
                             match res {
                                 Ok(n) => {
                                     if n == 0 {
@@ -96,6 +108,10 @@ pub async fn create_listener(
                                         };
                                         break (());
                                     }
+
+                                    // Update elapsed time.
+                                    last_active = Instant::now();
+
                                     // Reset read timeout.
                                     read_timeout_ms = 16f32;
 
@@ -106,7 +122,7 @@ pub async fn create_listener(
 
                                     // debug!(target: "atc-listener", "RAW MESSAGE: `{}`", content);
 
-                                    buffer = vec![0u8; 1024];
+                                    buffer = vec![0u8; 65535];
 
                                     for frame in frames {
                                         let command = ChannelCommand::from(frame);
